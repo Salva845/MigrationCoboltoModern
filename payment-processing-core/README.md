@@ -20,14 +20,15 @@ src/payment_processing_core/
   log_engine.py   TransactionLogEngine (immutable audit trail + idempotency)
   fraud.py        FraudScoringEngine (injectable; default heuristic)
   validator.py    TransactionValidator — BR-0001..BR-0010 + orchestration
-tests/            TC-0001..TC-0018 + business-rule/edge-case coverage
+  processing.py   TransactionProcessor — BANK74 fee/debit slice (BR-0011..BR-0018)
+tests/            TC-0001..TC-0018 (validator) + TC-0019..TC-0027 (processor)
 ```
 
 ## Run
 
 ```bash
 pip install -e ".[dev]"      # or: pip install pytest ruff
-pytest -q                    # 28 tests
+pytest -q                    # 48 tests
 ruff check . && ruff format --check .
 ```
 
@@ -59,7 +60,8 @@ discrete, off-critical-path methods.
 ## Error codes (`ErrorCode`)
 
 `WS-OK`, `WS-ERR-INVALID-FORMAT`, `WS-ERR-BLACKLISTED`, `WS-ERR-AUTH-DENIED`,
-`WS-ERR-INSUFF-FUNDS`, `WS-ERR-ACCOUNT-NOT-FOUND`, `WS-ERR-SYSTEM-ERROR`.
+`WS-ERR-INSUFF-FUNDS`, `WS-ERR-ACCOUNT-NOT-FOUND`, `WS-ERR-TIMEOUT`,
+`WS-ERR-SYSTEM-ERROR`.
 
 ## API contract
 
@@ -72,11 +74,59 @@ discrete, off-critical-path methods.
   failure rolls back (no debit) and yields `WS-ERR-SYSTEM-ERROR`.
 - **Money:** all monetary maths use `Decimal` (2dp, `ROUND_HALF_UP`).
 
+## BANK74 processing slice (prompt 05)
+
+`processing.py` is a **separate functional slice** migrated from legacy COBOL
+**BANK74** (wave 1, prompt 05): "Process a financial transaction with validation,
+fee calculation, and balance update". It is distinct from the BANK85 compliance
+flow above — there is no VAT, the fee is a flat **15.00**, and the high-risk
+threshold is **90,000.00**. Only the shared abstractions (ISO parser, `Account`,
+`State`, `ErrorCode`, `AccountRepository`) are reused. The HTTP transport wrapper
+for this slice lives in `payment-message-processing` (prompt 04); cross-service
+wiring is prompt 06.
+
+### API contract
+
+`TransactionProcessor.process(transaction_id: str, message: dict | Iso8583Message) -> ProcessingResult`
+
+`ProcessingResult.to_dict()` serialises the outcome (monetary values as 2dp
+strings) for an equivalence comparison against the legacy oracle (TC-0027).
+
+### Pipeline order (preserved from BANK74)
+
+| State | Value | Step |
+| --- | --- | --- |
+| VAL | 05¹ | account lookup, **BR-0011** min / **BR-0012** max thresholds |
+| DEBIT | 20¹ | **BR-0013** total = amount + 15.00 fee, **BR-0014** sufficiency |
+| CREDIT | 30 | **BR-0017** type 6 → timeout *before* write (no debit), else **BR-0015** atomic debit |
+| LOG | 40 | **BR-0018** high-risk scan (balance > 90,000.00), append audit entry |
+
+¹ The legacy VAL/DEBIT stage labels map onto the shared `State` enum values
+`VALIDATE` (3200) / `DEBIT` (3400); all error paths terminate in `AUDIT` (40).
+
+### Business rules
+
+| Rule | Behaviour |
+| --- | --- |
+| BR-0011 | reject `amount < min` → `WS-ERR-INVALID-FORMAT`, state 40 |
+| BR-0012 | reject `amount > max` → `WS-ERR-INVALID-FORMAT`, state 40 |
+| BR-0013 | total debit = `amount + 15.00` (fee added **before** sufficiency check) |
+| BR-0014 | `balance < total` → `WS-ERR-INSUFF-FUNDS`, state 40, **not debited** |
+| BR-0015 | atomic debit via optimistic lock (no partial update) |
+| BR-0016 | **REMOVED** — type-4 auth denial was test-only simulation code |
+| BR-0017 | type 6 → `WS-ERR-TIMEOUT`, state 40; checked **before** the debit so the balance is untouched |
+| BR-0018 | flag every account with `balance > 90,000.00` during logging (`>`, not `>=`); informational, never blocks |
+
+Idempotency (no double-debit on replay), atomic debit, and `Decimal`-only maths
+(2dp, `ROUND_HALF_UP`) hold for this slice too.
+
 ## Assumptions
 
 The legacy COBOL copybooks (`SECURITY-RULES.CPY`, `DATABASE.CPY`, …) were not
 included with this slice, so the threshold values in `config.py`
-(`min=1.00`, `max=1000000.00`, `vat=0.16`, `spei_fee=12.50`) are documented
+(`min=1.00`, `max=1000000.00`, `vat=0.16`, `spei_fee=12.50`) and in
+`ProcessingConfig` (BANK74: `min=1.00`, `max=1000000.00`, `fixed_fee=15.00`,
+`high_risk_threshold=90000.00`, `timeout_trans_type=6`) are documented
 assumptions isolated for a later equivalence pass. Per the prompt's noted
 spec contradiction, the fraud block is implemented as **score ≥ 60** (the
 acceptance test is authoritative).

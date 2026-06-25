@@ -24,8 +24,11 @@ class RuleConfig:
     fraud_high_amount_points: int = 40
     fraud_high_risk_level: int = 2
     fraud_high_risk_points: int = 30
-    # Block when score >= threshold. The spec is contradictory ("exceeds 60" vs
-    # TC-0006 "exactly 60 blocks"); the acceptance test is authoritative.
+    # Block when score crosses the threshold. Prompt 01 (payment-processing-core)
+    # blocks at score >= threshold (TC-0006: 60 blocks). Prompt 02
+    # (payment-message-processing) blocks at score > threshold (TC-0006: 60
+    # allows). The operator is selected by ``fraud_block_strict``.
     fraud_block_threshold: int = 60
+    fraud_block_strict: bool = False
     # High-balance flagging (BR-0010)
     high_balance_threshold: Decimal = Decimal("80000")

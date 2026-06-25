@@ -1,11 +1,17 @@
-"""End-to-end harness wiring the two wave-1 slices together.
+"""End-to-end harness wiring the wave-1 slices together.
 
-Prompt 03 (INTEGRATE) does not reimplement any business logic; the rules live in
-payment-processing-core (prompt 01) and the HTTP front end in
-payment-message-processing (prompt 02). This module composes both into a running
-system so the integration tests can drive the *real* HTTP boundary
-(POST /transactions/validate) and then assert cross-service effects against the
+The INTEGRATE prompts do not reimplement any business logic; the rules live in
+payment-processing-core and the HTTP front end in payment-message-processing.
+This module composes them into a running system so the integration tests can
+drive the *real* HTTP boundary and then assert cross-service effects against the
 shared account repository and transaction log engine.
+
+Two functional slices are exercised over the same server:
+
+- BANK85 compliance/fraud validation (prompt 03): POST /transactions/validate.
+- BANK74 fee/debit processing (prompt 06): POST /transactions/process, delegating
+  to the core ``TransactionProcessor`` (prompt 05) behind its controller (prompt
+  04). No VAT, a flat 15.00 fee and a 90,000.00 high-risk threshold.
 """
 
 import http.client
@@ -22,6 +28,8 @@ from decimal import Decimal
 from payment_message_processing import (
     Customer,
     InMemoryCustomerRepository,
+    ProcessingConfig,
+    TransactionProcessingController,
     TransactionValidationController,
     build_server,
 )
@@ -35,6 +43,7 @@ from payment_processing_core import (
 )
 
 VALIDATE_PATH = "/transactions/validate"
+PROCESS_PATH = "/transactions/process"
 
 
 def account(
@@ -70,7 +79,7 @@ def request_payload(
     account_id: str = "ACC1",
     customer_id: str | None = None,
 ) -> dict:
-    """Build a POST /transactions/validate JSON body (ISO 8583 envelope)."""
+    """Build a request JSON body (ISO 8583 envelope) for either endpoint."""
     payload: dict = {
         "transaction_id": txn_id,
         "message": {4: minor(amount), 3: trans_type, 102: account_id},
@@ -91,22 +100,23 @@ class IntegrationSystem:
 
     base_url: str
     controller: TransactionValidationController
+    processing_controller: TransactionProcessingController
     account_repository: AccountRepository
     customer_repository: InMemoryCustomerRepository
     log_engine: TransactionLogEngine
 
-    def post_validate(self, payload: object, retries: int = 4) -> tuple[int, dict]:
-        """POST a JSON body to /transactions/validate; return (status, body).
+    def _post(self, path: str, payload: object, retries: int = 4) -> tuple[int, dict]:
+        """POST a JSON body to ``path``; return (status, parsed body).
 
         The stdlib ``ThreadingHTTPServer`` can occasionally reset a connection
-        under heavy concurrent load (the TC-0017 stress test fires many requests
-        at once). Such resets are transient transport failures, so the request is
-        retried a few times; this is safe because the core pipeline is idempotent
-        (a repeated ``transaction_id`` never double-debits).
+        under heavy concurrent load (the concurrency stress tests fire many
+        requests at once). Such resets are transient transport failures, so the
+        request is retried a few times; this is safe because both pipelines are
+        idempotent (a repeated ``transaction_id`` never double-debits).
         """
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
-            f"{self.base_url}{VALIDATE_PATH}",
+            f"{self.base_url}{path}",
             data=data,
             headers={"Content-Type": "application/json"},
             method="POST",
@@ -123,6 +133,14 @@ class IntegrationSystem:
                 time.sleep(0.02 * (attempt + 1))
         raise AssertionError(f"request failed after {retries} attempts: {last_exc}")
 
+    def post_validate(self, payload: object, retries: int = 4) -> tuple[int, dict]:
+        """POST to /transactions/validate (BANK85 slice); return (status, body)."""
+        return self._post(VALIDATE_PATH, payload, retries)
+
+    def post_process(self, payload: object, retries: int = 4) -> tuple[int, dict]:
+        """POST to /transactions/process (BANK74 slice); return (status, body)."""
+        return self._post(PROCESS_PATH, payload, retries)
+
 
 @contextmanager
 def running_system(
@@ -132,12 +150,15 @@ def running_system(
     *,
     account_repository: AccountRepository | None = None,
     log_engine: TransactionLogEngine | None = None,
+    processing_config: ProcessingConfig | None = None,
 ) -> Iterator[IntegrationSystem]:
     """Boot the wired system on an ephemeral port and yield a client.
 
     The HTTP server (payment-message-processing) delegates to the core
-    TransactionValidator (payment-processing-core); both share the supplied
-    repository and log engine so effects are observable from the test.
+    TransactionValidator and TransactionProcessor (payment-processing-core); all
+    share the supplied repository and log engine so effects are observable from
+    the test. The same server exposes both wave-1 slices: /transactions/validate
+    (BANK85) and /transactions/process (BANK74).
     """
     repo = account_repository or InMemoryAccountRepository(accounts or [account()])
     cust_repo = InMemoryCustomerRepository(customers or [])
@@ -148,8 +169,17 @@ def running_system(
         log_engine=log,
         fraud_engine=fraud,
     )
+    processing_controller = TransactionProcessingController(
+        account_repository=repo,
+        config=processing_config,
+    )
 
-    server = build_server(controller, host="127.0.0.1", port=0)
+    server = build_server(
+        controller,
+        host="127.0.0.1",
+        port=0,
+        processing_controller=processing_controller,
+    )
     port = server.server_address[1]
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -157,6 +187,7 @@ def running_system(
         yield IntegrationSystem(
             base_url=f"http://127.0.0.1:{port}",
             controller=controller,
+            processing_controller=processing_controller,
             account_repository=repo,
             customer_repository=cust_repo,
             log_engine=log,

@@ -1,0 +1,31 @@
+[project]
+name = "payment-message-processing"
+version = "0.1.0"
+description = "Wave 1 / prompt 02: ISO 8583 payment message validation REST service (BANK85 migration)."
+requires-python = ">=3.10"
+# Runtime dependency on the sibling slice. It lives in this monorepo and is
+# installed editable (see README / CI), so it is not resolved from PyPI here.
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.5"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# payment-processing-core is a sibling slice imported as a library; both source
+# trees are placed on the path so tests run without an editable install.
+pythonpath = ["src", "../payment-processing-core/src"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

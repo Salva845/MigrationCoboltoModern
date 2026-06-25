@@ -41,7 +41,12 @@ class TransactionValidator:
     # ------------------------------------------------------------------ #
     # Entry point
     # ------------------------------------------------------------------ #
-    def process(self, transaction_id: str, message: dict | Iso8583Message) -> TransactionResult:
+    def process(
+        self,
+        transaction_id: str,
+        message: dict | Iso8583Message,
+        employee_id: int | None = None,
+    ) -> TransactionResult:
         # Idempotency: a repeated transaction id returns the cached result and
         # never double-debits.
         cached = self.log_engine.get(transaction_id)
@@ -55,7 +60,7 @@ class TransactionValidator:
             return self._fail(transaction_id, "?", 0, Decimal("0.00"), exc, State.VALIDATE)
 
         try:
-            result = self._run_pipeline(transaction_id, iso)
+            result = self._run_pipeline(transaction_id, iso, employee_id)
         except TransactionError as exc:
             result = self._fail(
                 transaction_id,
@@ -82,7 +87,9 @@ class TransactionValidator:
     # ------------------------------------------------------------------ #
     # Pipeline (order is significant - see prompt section 8)
     # ------------------------------------------------------------------ #
-    def _run_pipeline(self, transaction_id: str, iso: Iso8583Message) -> TransactionResult:
+    def _run_pipeline(
+        self, transaction_id: str, iso: Iso8583Message, employee_id: int | None = None
+    ) -> TransactionResult:
         # Step 3: account lookup.
         account = self.repository.find_by_account_id(iso.account_id)
         if account is None:
@@ -103,6 +110,14 @@ class TransactionValidator:
         # Fraud heuristics (8500), then insufficient-funds (3400), then debit.
         self.br0008_fraud_scoring(iso.amount, account.risk_level)
         self.br0005_insufficient_funds(account, final_amount)
+
+        # BR-0009: payroll employee parity (only when a payroll context supplies
+        # an employee id; non-payroll transactions skip this rule).
+        if employee_id is not None and self.br0009_validate_employee(employee_id) == "P":
+            raise TransactionError(
+                ErrorCode.AUTH_DENIED,
+                f"payroll blocked: employee {employee_id} has an even id (status 'P')",
+            )
 
         # Step 11/12: atomic debit + transition to credit state.
         try:
@@ -191,9 +206,12 @@ class TransactionValidator:
 
     def br0008_fraud_scoring(self, amount: Decimal, risk_level: int) -> None:
         score = self.fraud_engine.score(amount, risk_level)
-        if score >= self.config.fraud_block_threshold:
+        threshold = self.config.fraud_block_threshold
+        blocked = score > threshold if self.config.fraud_block_strict else score >= threshold
+        if blocked:
+            op = ">" if self.config.fraud_block_strict else ">="
             raise TransactionError(
-                ErrorCode.BLACKLISTED, f"fraud score {score} >= {self.config.fraud_block_threshold}"
+                ErrorCode.BLACKLISTED, f"fraud alert: fraud score {score} {op} {threshold}"
             )
 
     def br0009_validate_employee(self, emp_id: int | None) -> str:

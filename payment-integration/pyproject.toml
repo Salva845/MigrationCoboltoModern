@@ -1,0 +1,35 @@
+[project]
+name = "payment-integration"
+version = "0.1.0"
+description = "Wave 1 / prompt 03: end-to-end integration of payment-message-processing and payment-processing-core (BANK85 migration)."
+requires-python = ">=3.10"
+# Integration slice: depends on both wave-1 services. They live in this monorepo
+# and are placed on the import path via pythonpath below (no editable install).
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.5"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Both sibling slices are imported as libraries; their source trees are placed on
+# the path so the integration tests run without any editable install.
+pythonpath = [
+    "src",
+    "../payment-processing-core/src",
+    "../payment-message-processing/src",
+]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

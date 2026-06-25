@@ -23,8 +23,12 @@ src/payment_message_processing/
   parser.py       request envelope + ISO 8583 field extraction (ISO-PARSER.CPY)
   dto.py          TransactionResponse body + ErrorCode -> HTTP status map
   controller.py   TransactionValidationController (orchestrates core validator)
-  http_app.py     POST /transactions/validate (stdlib http.server)
-tests/            TC-0001..TC-0018 + BR-0009/idempotency/edge-case/HTTP coverage
+  processing.py   TransactionProcessor — BANK74 slice (prompt 04, see below)
+  processing_controller.py  TransactionProcessingController (BANK74 HTTP)
+  http_app.py     POST /transactions/validate + POST /transactions/process
+tests/
+  test_service.py     TC-0001..TC-0018 + BR-0009/idempotency/edge-case/HTTP (BANK85)
+  test_processing.py  TC-0019..TC-0027 + BR-0016-removed/timeout/high-risk (BANK74)
 ```
 
 ## Run
@@ -104,6 +108,7 @@ and never affects the outcome.
 | `WS-ERR-AUTH-DENIED` | 403 |
 | `WS-ERR-INSUFF-FUNDS` | 409 |
 | `WS-ERR-ACCOUNT-NOT-FOUND` | 404 |
+| `WS-ERR-TIMEOUT` | 504 |
 | `WS-ERR-SYSTEM-ERROR` | 500 |
 
 ## State machine
@@ -123,3 +128,67 @@ to `40` (audit) for blacklist / insufficient funds.
   BR-0005 when an `employee_id` is supplied; an even id (incl. 0) sets status
   `'P'` and rejects with `WS-ERR-AUTH-DENIED`. Non-payroll transactions (no
   customer) skip it — preserving prompt 01 behaviour.
+
+---
+
+# BANK74 processing slice (prompt 04)
+
+A **separate functional slice** (legacy COBOL **BANK74**) living in the same
+service: *"process a financial transaction with validation, fee calculation and
+balance update"*. It does **not** reuse the BANK85 rules, constants or fee
+structure above — only the shared `payment-processing-core` abstractions
+(`Account`, `AccountRepository`, ISO 8583 parser, `State`, `ErrorCode`).
+
+`POST /transactions/process` — `Content-Type: application/json`
+
+Request (same envelope as `/validate`; `customer_id` is ignored here):
+
+```json
+{ "transaction_id": "T19", "message": { "4": "10000", "3": 0, "102": "ACC1" } }
+```
+
+Success response (HTTP 200):
+
+```json
+{
+  "transaction_id": "T19", "success": true, "status": "WS-OK", "state": 30,
+  "account_id": "ACC1", "trans_type": 0, "original_amount": "100.00",
+  "fee": "15.00", "total_debit": "115.00", "updated_balance": "885.00",
+  "high_risk_accounts": [], "message": "transaction posted",
+  "duplicate": false, "timestamp": "..."
+}
+```
+
+## Business rules and numeric policy (`ProcessingConfig`)
+
+| Rule | Description | Constant |
+| --- | --- | --- |
+| BR-0011 | amount ≥ minimum | `min_amount = 1.00` |
+| BR-0012 | amount ≤ maximum | `max_amount = 1000000.00` |
+| BR-0013 | total debit = amount + fixed fee | `fixed_fee = 15.00` |
+| BR-0014 | balance ≥ total debit (no overdraft) | — |
+| BR-0015 | atomic debit (optimistic locking, rollback on conflict) | — |
+| BR-0017 | type 6 simulates a credit-state timeout (no debit) | `timeout_trans_type = 6` |
+| BR-0018 | flag accounts with balance **>** threshold during logging | `high_risk_threshold = 90000.00` |
+| BR-0016 | **REMOVED** — legacy test-only type-4 auth denial, not migrated | — |
+
+Thresholds are isolated in the `ProcessingConfig` dataclass (no hard-coding) and
+overridable. Legacy copybooks were not supplied, so `min`/`max` are documented
+assumptions for a later equivalence pass; the fee and high-risk threshold are
+fixed by the prompt.
+
+## Pipeline / state order
+
+`05` (validate amount: BR-0011 → BR-0012) → `20` (debit: BR-0013 total → BR-0014
+sufficiency) → timeout check (BR-0017, before any write) → `20` actual debit
+(BR-0015) → `30` (credit, success). Every error path routes to `40` (audit). The
+BR-0018 high-risk scan runs **during the logging state (40)** for both success
+and failure, so the flags are part of the persisted audit entry.
+
+- Monetary maths use `Decimal` exclusively, quantized to 2 places (`ROUND_HALF_UP`).
+- **Idempotency**: a repeated `transaction_id` returns the cached result with
+  `duplicate: true` and never double-debits.
+- The timeout check sits *before* `UpdateAccountBalance`, so type-6 transactions
+  leave the balance untouched (TC-0026).
+
+Acceptance tests **TC-0019..TC-0027** live in `tests/test_processing.py`.

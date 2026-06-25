@@ -12,13 +12,18 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from payment_processing_core import ErrorCode
 
 from .controller import TransactionValidationController
+from .processing_controller import TransactionProcessingController
 
 logger = logging.getLogger("payment_message_processing")
 
 VALIDATE_PATH = "/transactions/validate"
+PROCESS_PATH = "/transactions/process"
 
 
-def make_handler(controller: TransactionValidationController) -> type[BaseHTTPRequestHandler]:
+def make_handler(
+    controller: TransactionValidationController,
+    processing_controller: TransactionProcessingController | None = None,
+) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         def _write_json(self, status_code: int, body: dict) -> None:
             payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
@@ -29,7 +34,12 @@ def make_handler(controller: TransactionValidationController) -> type[BaseHTTPRe
             self.wfile.write(payload)
 
         def do_POST(self) -> None:  # noqa: N802 - http.server naming.
-            if self.path.rstrip("/") != VALIDATE_PATH:
+            route = self.path.rstrip("/")
+            if route == VALIDATE_PATH:
+                handler = controller.validate
+            elif route == PROCESS_PATH and processing_controller is not None:
+                handler = processing_controller.process
+            else:
                 self._write_json(404, {"status": "not found", "path": self.path})
                 return
 
@@ -49,7 +59,7 @@ def make_handler(controller: TransactionValidationController) -> type[BaseHTTPRe
                 )
                 return
 
-            response = controller.validate(payload)
+            response = handler(payload)
             self._write_json(response.status_code, response.body)
 
         def log_message(self, fmt: str, *args) -> None:
@@ -59,6 +69,9 @@ def make_handler(controller: TransactionValidationController) -> type[BaseHTTPRe
 
 
 def build_server(
-    controller: TransactionValidationController, host: str = "127.0.0.1", port: int = 8080
+    controller: TransactionValidationController,
+    host: str = "127.0.0.1",
+    port: int = 8080,
+    processing_controller: TransactionProcessingController | None = None,
 ) -> ThreadingHTTPServer:
-    return ThreadingHTTPServer((host, port), make_handler(controller))
+    return ThreadingHTTPServer((host, port), make_handler(controller, processing_controller))

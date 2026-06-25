@@ -8,8 +8,10 @@ system so the integration tests can drive the *real* HTTP boundary
 shared account repository and transaction log engine.
 """
 
+import http.client
 import json
 import threading
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Iterator
@@ -93,8 +95,15 @@ class IntegrationSystem:
     customer_repository: InMemoryCustomerRepository
     log_engine: TransactionLogEngine
 
-    def post_validate(self, payload: object) -> tuple[int, dict]:
-        """POST a JSON body to /transactions/validate; return (status, body)."""
+    def post_validate(self, payload: object, retries: int = 4) -> tuple[int, dict]:
+        """POST a JSON body to /transactions/validate; return (status, body).
+
+        The stdlib ``ThreadingHTTPServer`` can occasionally reset a connection
+        under heavy concurrent load (the TC-0017 stress test fires many requests
+        at once). Such resets are transient transport failures, so the request is
+        retried a few times; this is safe because the core pipeline is idempotent
+        (a repeated ``transaction_id`` never double-debits).
+        """
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
             f"{self.base_url}{VALIDATE_PATH}",
@@ -102,11 +111,17 @@ class IntegrationSystem:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        try:
-            with urllib.request.urlopen(req) as resp:  # noqa: S310 - localhost test server.
-                return resp.status, json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:  # 4xx/5xx still carry a JSON body.
-            return exc.code, json.loads(exc.read().decode("utf-8"))
+        last_exc: Exception | None = None
+        for attempt in range(retries):
+            try:
+                with urllib.request.urlopen(req) as resp:  # noqa: S310 - localhost test server.
+                    return resp.status, json.loads(resp.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:  # 4xx/5xx still carry a JSON body.
+                return exc.code, json.loads(exc.read().decode("utf-8"))
+            except (ConnectionError, http.client.RemoteDisconnected, urllib.error.URLError) as exc:
+                last_exc = exc
+                time.sleep(0.02 * (attempt + 1))
+        raise AssertionError(f"request failed after {retries} attempts: {last_exc}")
 
 
 @contextmanager

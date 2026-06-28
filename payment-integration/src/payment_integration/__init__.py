@@ -7,6 +7,8 @@ reimplemented here; this package only composes the two slices and asserts the
 end-to-end contract.
 """
 
+from payment_message_processing import ProcessingConfig
+
 from .harness import (
     IntegrationSystem,
     account,
@@ -17,6 +19,7 @@ from .harness import (
 
 __all__ = [
     "IntegrationSystem",
+    "ProcessingConfig",
     "account",
     "minor",
     "request_payload",
